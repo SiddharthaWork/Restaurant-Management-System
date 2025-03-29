@@ -1,0 +1,74 @@
+name: CI/CD for Express.js with TypeScript (VPS Deployment)
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "server/**"
+      - ".github/workflows/server.yml"
+env:
+  NODE_VERSION: 20
+  APP_NAME: restaurant-backend
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: "./server/package-lock.json"
+
+      - name: Install dependencies
+        working-directory: ./server
+        run: |
+          rm -rf node_modules
+          npm ci
+
+      - name: Build TypeScript
+        working-directory: ./server
+        run: npm run build
+
+      - name: Create production bundle
+        working-directory: ./server
+        run: |
+          npm prune --omit=dev
+          tar -czf ../dist.tar.gz dist package.json package-lock.json .env ecosystem.config.js
+
+      - name: Deploy to VPS
+        if: github.ref == 'refs/heads/main'
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H $VPS_HOST >> ~/.ssh/known_hosts
+          scp -i ~/.ssh/deploy_key dist.tar.gz $VPS_USER@$VPS_HOST:/tmp/
+          ssh -i ~/.ssh/deploy_key $VPS_USER@$VPS_HOST << 'EOF'
+            # Create new app directory and extract files
+            mkdir -p "restaurant/server"
+            tar -xzf /tmp/dist.tar.gz -C "restaurant/server"
+            rm /tmp/dist.tar.gz
+
+            # Install production dependencies
+            cd "restaurant/server"
+
+            npm ci --omit=dev
+
+            echo "Current directory: $(pwd)"
+            
+            # Start/Restart application using PM2 config
+            pm2 start ecosystem.config.js --env production --update-env
+
+            pm2 save --force
+
+            # Setup startup script (if not already set up)
+            sudo -E env "PATH=$PATH:/usr/bin" pm2 startup systemd -u $VPS_USER --hp "/home/$VPS_USER" || true
+          EOF
